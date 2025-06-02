@@ -708,6 +708,17 @@ The below rules are currently implemented or are very similar to an existing val
     N/A
    </td>
   </tr>
+  <tr>
+     <td>
+      immutable once set
+     </td>
+     <td>
+      `+k8s:immutableOnceSet`
+     </td>
+     <td>
+      N/A
+     </td>
+  </tr>
 </table>
 
 The below rules are not currently implemented in the [validation-gen prototype](https://github.com/jpbetz/kubernetes/tree/validation-gen) so the exact syntax is still WIP
@@ -947,6 +958,212 @@ The linter, as previously described, will enforce rules to address valid zero-va
     *   Perform checks on other tag values based on any `+k8s:default` tag value (where applicable).
 
 The linter will flag any violations of these rules, ensuring consistent zero-value handling and preventing related errors. This automated enforcement is crucial for catching issues early in the development process.
+
+### Immutability Validation
+
+Kubernetes APIs have numerous fields that become immutable under various conditions. Currently, these rules are implemented through hand-written validation code, which can be complex and error-prone. Declarative validation introduces specific tags to express these common immutability patterns clearly and concisely.
+
+#### Immutability Scoping
+
+Immutability applies within the parent struct instance. When an optional parent is replaced, child immutability resets:
+
+```go
+type Spec struct {
+    // +optional
+    OptionalConfig *Config `json:"optionalConfig,omitempty"`
+}
+
+type Config struct {
+    // +k8s:immutableOnceSet
+    Value string `json:"value"`
+}
+```
+
+**Lifecycle:**
+
+1.  Create with `optionalConfig = nil` ✅
+1.  Set `optionalConfig.Value = "foo"` ✅
+1.  Change `optionalConfig.Value = "bar"` ❌
+1.  Delete `optionalConfig` (nil) ✅
+1.  Set new `optionalConfig.Value = "baz"` ✅ (new instance)
+
+#### The Problem with Optional Parents
+
+```go
+type Spec struct {
+    // +optional
+    OptionalConfig *Config `json:"optionalConfig,omitempty"`
+}
+
+type Config struct {
+    // +k8s:immutableOnCreate  // ❌ BROKEN!
+    Value string `json:"value"`
+}
+```
+
+**Why it breaks:**
+
+1.  Create without config ✅
+1.  Delete config ❌ **BROKEN**
+1.  Create new with config ❌ **BROKEN**
+
+#### Immutability Tag Lint Rules
+
+```
+Is the parent struct optional (pointer)?
+├─ YES → lint rule preventing +k8s:immutableOnCreate 
+└─ NO → Is the field required?
+    └─ YES → lint rule allowing only +k8s:immutableOnCreate as immutable tag option
+```
+
+#### Immutability Categories
+
+Based on analysis of existing validation rules in `pkg/apis/*/validation.go`, we've identified three main categories of immutability patterns:
+
+1.  **Immutable Once Set** - Fields that can transition from unset to set, then become immutable
+1.  **Immutable On Create** - Fields that must be set at creation and cannot change
+1.  **Conditionally Immutable** - Fields whose immutability depends on other field values
+
+#### Immutability Tags
+
+##### +k8s:immutableOnceSet
+
+**Definition:** Field can be unset at creation, set once, then immutable within the parent instance.\
+**Tag:** `+k8s:immutableOnceSet`\
+**Safe in optional parents:** Yes\
+**Interactions with +k8s:optional and +k8s:default:**
+
+-   +k8s:optional - Allows transition from unset to set
+-   +k8s:default - If default is non-zero, field is considered "set" from creation
+
+**Migration Example:**
+
+```go
+// Example: PersistentVolumeClaim volumeName binding
+// Before (hand-written validation)
+func ValidatePersistentVolumeClaimUpdate(newPvc, oldPvc *core.PersistentVolumeClaim) field.ErrorList {
+    allErrs := ValidatePersistentVolumeClaim(newPvc)
+    if len(oldPvc.Spec.VolumeName) > 0 &&
+        oldPvc.Spec.VolumeName != newPvc.Spec.VolumeName {
+        allErrs = append(allErrs, field.Forbidden(
+            field.NewPath("spec", "volumeName"), 
+            "PVC is bound to another PV"))
+    }
+    // ... more validation
+}
+
+// After (declarative validation)
+type PersistentVolumeClaimSpec struct {
+    // +k8s:immutableOnceSet
+    VolumeName string `json:"volumeName,omitempty"`
+}
+```
+
+Example k/k rules with this pattern:
+
+-   core/v1/PersistentVolumeClaim's volume name is set when bound to a PV by the controller and cannot be changed ([link](https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/validation/validation.go#L2401-L2406))
+-   core/v1/Node's provider ID is set when the cloud provider identifies the instance and cannot be changed
+-   core/v1/Service's cluster IP is allocated by the system or specified by user and cannot be changed
+
+##### +k8s:immutableOnCreate
+
+**Definition:** Field must be set at creation and cannot change.\
+**Tag:** `+k8s:immutableOnCreate`\
+**Safe in optional parents:** No\
+**Interactions with +k8s:optional and +k8s:default:**
+
+-   +k8s:optional - Optional fields that are not set at creation remain unset
+-   +k8s:default - Defaulted value at creation cannot be changed
+
+**Migration Example:**
+
+```go
+// Example: StorageClass parameters
+// Before (hand-written validation)
+func ValidateStorageClassUpdate(storageClass, oldStorageClass *storage.StorageClass) field.ErrorList {
+    allErrs := ValidateStorageClass(storageClass)
+    if !reflect.DeepEqual(oldStorageClass.Parameters, storageClass.Parameters) {
+        allErrs = append(allErrs, field.Forbidden(field.NewPath("parameters"), 
+            "updates to parameters are forbidden."))
+    }
+    // ... more validation
+}
+
+// After (declarative validation)
+type StorageClass struct {
+    // +k8s:immutableOnCreate
+    Parameters map[string]string `json:"parameters,omitempty"`
+}
+```
+
+Example k/k rules with this pattern:
+
+-   storage.k8s.io/v1/StorageClass's parameters and reclaim policy cannot be changed after creation ([link](https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/storage/validation/validation.go#L71-L81))
+-   core/v1/Secret's type (e.g., Opaque, kubernetes.io/tls) cannot be changed
+-   storage.k8s.io/v1/CSIDriver's attach requirements and volume lifecycle modes cannot be changed
+-   node.k8s.io/v1/RuntimeClass's handler cannot be changed
+
+##### +k8s:immutableWhenFieldEquals
+
+**Definition:** Field immutability depends on another field's value.\
+**Tag:** `+k8s:immutableWhenFieldEquals=<field>,<value>`\
+**Safe in optional parents:** Yes (condition re-evaluates per instance)\
+**Interactions with +k8s:optional and +k8s:default:**
+
+-   +k8s:optional - Condition applies regardless of optional status
+-   +k8s:default - Condition evaluates after defaulting
+
+**Migration Example:**
+
+```go
+// Example: Secret with immutable flag
+// Before (hand-written validation)
+func ValidateSecretUpdate(newSecret, oldSecret *core.Secret) field.ErrorList {
+    if oldSecret.Immutable != nil && *oldSecret.Immutable {
+        if !reflect.DeepEqual(newSecret.Data, oldSecret.Data) {
+            allErrs = append(allErrs, field.Forbidden(
+                field.NewPath("data"), 
+                "field is immutable when `immutable` is set"))
+        }
+        if newSecret.Immutable == nil || !*newSecret.Immutable {
+            allErrs = append(allErrs, field.Forbidden(
+                field.NewPath("immutable"), 
+                "field is immutable when `immutable` is set"))
+        }
+    }
+    // ... more validation
+}
+
+// NOTE: cross-field validations go on common ancestor
+
+// +k8s:immutableWhenFieldEquals(target: data, reference: immutable)
+// +k8s:immutableWhenFieldEquals(target: immutable, reference: immutable)
+type Secret struct {
+    // +k8s:reference(name: data)
+    Data map[string][]byte `json:"data,omitempty"`
+    // +k8s:reference(name: immutable)
+    Immutable *bool `json:"immutable,omitempty"`
+}
+```
+
+Example k/k rules with this pattern:
+
+-   core/v1/Secret's data and the immutable flag itself cannot be changed when the immutable field is set to true ([link](https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/validation/validation.go#L7038-L7056))
+-   core/v1/ConfigMap's data, binary data, and immutable flag cannot be changed when the immutable field is true
+-   core/v1/PersistentVolumeClaim's spec fields (except resources.requests and volumeAttributesClassName) cannot be changed when the claim is bound
+-   certificates.k8s.io/v1/CertificateSigningRequest's certificate cannot be modified once set (unless specific conditions allow resetting -> conditional)
+
+#### Subresource-Aware Immutability
+
+Fields can have different immutability rules depending on the subresource. Validating these properly can be done combining subresource conditional tags with immutability tags:
+
+```go
+type Container struct {
+    // Immutable via main resource, mutable via /resize
+    // +k8s:ifNotSubresource("/resize")=+k8s:immutableOnCreate
+    Resources ResourceRequirements `json:"resources,omitempty"`
+}
+```
 
 ### Subresources
 

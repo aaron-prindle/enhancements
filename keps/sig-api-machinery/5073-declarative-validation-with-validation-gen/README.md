@@ -226,6 +226,7 @@ Please feel free to try out the [prototype](https://github.com/jpbetz/kubernetes
 *   Eliminate 90% of net-new hand-written validation within 5 kube releases (target start: v1.33)
 *   Convert 50% of existing hand-written validation within 5 kube releases (target start: v1.33)
 *   Migrate in such a way that if contributors lose steam and abandon this, we can roll it back relatively easily.
+*   Enable new APIs to adopt declarative validation natively without requiring a handwritten fallback, simplifying API development and review.
 *   `types.go` files become the de-facto IDL of Kubernetes for native types. It is worth noting that `+enum` support, `+default` support and similar enhancements all moved our API development forward in this direction. This enhancement is an attempt to continue that story arc.
 *   API Validations are readable and manageable. The IDL should be a joy to use for API authors, reviewers and maintainers. Common complex relationships have simple-to-express idioms in the IDL.
     *   Reduce API development costs for API authors and reviewers. Reduce long term maintainer costs. Reclaiming time from core project contributors.
@@ -323,6 +324,20 @@ Declarative Validation will target the Beta stage from the beginning (vs Alpha).
 
 `DeclarativeValidationTakeover` will default to `false` initially in Beta.  This way during the initial rollout we can "soak" and verify that the errors produced for a replaced validation rule (handwritten -> declarative) are identical.  Over time the goal is to flip `DeclarativeValidationTakeover` to be default `true` such that for fields where declarative validation rules exist, they are used as the authoritative validation rule.
 
+#### Behavior for Mixed Validation Scenarios (Migrated Validations + "DV-Only" Validations)
+
+To allow new APIs (DRA, etc.) to use Declarative Validation without a handwritten fallback, we introduce the concept of "DV-Only" rules. These rules are permanent and always enforced for a given type. This creates a "mixed validation" scenario for an API type that contains both migrated DV rules and new DV-Only rules.
+
+*   **[Existing Case] API type with only migrated DV validations** (eg: ReplicationController, CSR):
+    *   Existing behavior is unchanged. The logic respects both the `DeclarativeValidation` and `DeclarativeValidationTakeover` feature gates as described above.
+
+*   **[NEW Case] API type with Mixed validations** (Migrated DV + DV-Only, like DRA):
+    *   All declarative validations (both Migrated and DV-Only) for these types will **always run**, regardless of the `DeclarativeValidation` gate's value.
+    *   Errors from **DV-Only** rules are **always shown** and are not controlled by any feature gate.
+    *   The `DeclarativeValidationTakeover` gate **only** controls which errors users see for the **Migrated DV** rules.
+
+This approach allows new workstreams to confidently adopt DV for new validation logic, establishing it as an official component, while preserving the safety and rollout controls for the ongoing migration of existing, handwritten rules.
+
 ### Linter
 
 As we transition from handwritten validation to a declarative approach using validation tags, a linter becomes essential to ensure the correct and consistent use of these tags. It will maintain the integrity of the validation process during and after the migration. It will also enforce the rules around using validation tags, preventing common mistakes (e.g. see Tri-state mutual exclusive option for handling zero values) and ensuring that the generated validation logic behaves as intended.
@@ -388,6 +403,42 @@ Based on this analysis we believe that the proposed `validation-gen` design can 
 ##### Mitigation: Roll Back All Migrated Fields
 
 In the case that the workstream loses steam over time and the migration project is abandoned, users can still roll back to the previous hand-written validation by disabling the `DeclarativeValidation` feature gate.
+
+#### Risk: Committing to DV Makes Future Reversals More Costly
+
+By allowing new APIs to be developed with "DV-Only" rules (i.e., no handwritten fallback), we are establishing DV as a permanent component for those APIs. If a future decision were made to back out of the Declarative Validation initiative entirely, it would become significantly more work. We would need to perform a reverse migration to generate handwritten validation code from the DV tags for these new APIs before removing the DV tooling.
+
+##### Mitigation: Incremental Adoption and Calculated Risk
+
+This is a calculated risk that reflects growing confidence in the Declarative Validation project. The "DV-Only" approach is limited to *net-new* APIs and validations, which provides a clear and contained path for adoption. It does not affect the rollback strategy for existing types that are being migrated. This incremental step allows us to prove the value of DV for new development while the broader migration of legacy code continues under the safety of the existing feature gate mechanism.
+
+#### Risk: Altered Feature Gate Semantics for Mixed Validation Types
+
+Introducing "DV-Only" rules changes the fundamental behavior of the `DeclarativeValidation` feature gate for any API type that adopts them. Previously, setting `DeclarativeValidation=false` acted as a complete off-switch, preventing the execution of any generated declarative validation code.
+
+For new API types that mix "DV-Only" and migrated validations, this is no longer the case. The declarative validation code path for these types will **always run**, regardless of the feature gate's setting, to ensure the permanent "DV-Only" rules are enforced. The `DeclarativeValidation` gate's role is reduced to only controlling whether the system performs a comparison against handwritten rules for the *migrated* portion of the validation. This creates a dual-behavior system for the feature gates, which could be confusing for operators and violates the expectation that a feature gate can fully disable a feature's code path.
+
+##### Mitigation: Clear Separation of Use Cases and Communication
+
+This is a calculated trade-off to enable progress and native adoption of Declarative Validation for new APIs. The mitigation strategy relies on clear distinctions and communication:
+
+*   **Explicit Tracks for Adoption:** The migration plan is now explicitly split into two tracks: "Migration" and "Native Adoption (DV-Only)". The original, safer feature gate behavior is preserved for all types in the "Migration" track.
+*   **Containment:** The new, altered gate behavior is strictly limited to the small, well-defined set of new APIs that opt into the "Native Adoption" track. It does not affect the rollback strategy or safety guarantees for the vast majority of existing Kubernetes APIs being migrated.
+*   **Documentation and Communication:** The KEP, release notes, and future documentation will clearly describe this dual-mode behavior, explaining when and why the declarative validation code always runs for certain types. This ensures cluster administrators understand the scope and impact of the feature gates.
+
+#### Risk: Panics in Mixed Validation Scenarios Cause Validation to "Fail-Closed"
+
+For API types that mix "DV-Only" rules with migrated DV rules, the behavior in the event of a panic changes significantly. In the existing migration-only case (e.g., ReplicationController), if a panic occurs in the declarative validation code while `DeclarativeValidationTakeover` is `false`, the panic is recovered and ignored. The system "fails open" by falling back to the trusted handwritten validation result.
+
+However, in a mixed validation scenario, the system cannot distinguish whether a panic originated from a permanent "DV-Only" rule or a feature-gated migrated rule. To ensure new APIs are not left with unenforceable validation, any panic in the declarative validation path will cause the entire validation to fail, returning an error to the user. This "fail-closed" behavior is safer for new APIs but means a bug in a *migrated* rule—which would have previously been safely ignored—could now block the creation or update of new API types that are adopting DV natively.
+
+##### Mitigation: Limited Scope and Comprehensive Testing
+
+The mitigation strategy for this is multi-faceted, focusing on containing the scope of the change and implementing robust testing to prevent panics in the first place:
+
+*   **Limited Initial Scope:** The "DV-Only" approach will be introduced for a small number of new API types. This ensures that any potential risks are contained and do not affect the stability of existing core APIs.
+*   **Comprehensive Unit and Fuzz Testing:** The generated validation logic for these new types will undergo thorough unit and fuzz testing. The primary goal of this testing is to ensure the code is error-proof and, most importantly, **panic-proof**, directly addressing the "fail-closed" concern.
+*   **Leveraging Existing E2E Test Coverage:** Existing end-to-end (e2e) testing infrastructure will provide an additional layer of validation, helping to catch any unforeseen issues in a broader, integrated context.
 
 #### Risk: we get hundreds of PRs from people migrating fields and can't review them all. 
 
@@ -885,6 +936,20 @@ To mitigate this issue for users we will implement the chain of typedefs logic a
 As we get feedback from our design partners, if there is a necessity to extend the above AST logic that is used for linting to instead allow for full support of n-deep nested typedefs we will implement re-discovering the chain of typedefs and implement nested typedef for IDL tags.
 
 ### Migration Plan
+
+Starting in v1.35, this plan is augmented to support two parallel tracks:
+1.  **Migration:** The ongoing, community-driven effort to convert existing handwritten validation to DV, as detailed below. This track continues to be governed by the `DeclarativeValidation` and `DeclarativeValidationTakeover` feature gates.
+2.  **Native Adoption (DV-Only):** Enabling new APIs and features (like DRA) to implement their validation rules using *only* Declarative Validation, without a handwritten fallback. These "DV-Only" rules are permanently enabled and are not controlled by feature gates.
+
+The following phases primarily describe the **Migration** track, while native adoption occurs as new APIs are developed.
+
+#### Supporting New APIs with "DV-Only" Validation
+
+To simplify development for new Kubernetes workstreams, we will allow them to implement validation logic using only DV tags. This "DV-Only" approach means that for any new validation rule, developers are not required to write corresponding handwritten Go code.
+
+This establishes DV as the permanent and authoritative source of validation for these new rules. To achieve this, the implementation distinguishes between validations that are migrated from handwritten code and those that are "DV-Only". This allows DV-Only rules to be always-on for a given type, while the feature gates continue to manage the phased rollout of the migrated rules for that same type, as described in the "Behavior for Mixed Validation Scenarios" section. This provides a clear path for new features to leverage the benefits of DV immediately.
+
+---
 
 This plan outlines the steps involved in migrating Kubernetes API validation from handwritten code to a declarative approach using validation tags and code generation. The process of migration will be incremental and community-driven. 
 
@@ -1843,6 +1908,8 @@ If the API server is failing to meet SLOs (latency, validation error-rate, etc.)
     * Roll back (only if absolutely necessary) after confirming the downstream impact (see “Can the feature be disabled once it has been enabled?”).
 
 ## Implementation History
+*   **v1.35:** Proposal to introduce 'DV-Only' support for new APIs, allowing them to use declarative validation without a handwritten fallback.
+
 
 ## Drawbacks
 

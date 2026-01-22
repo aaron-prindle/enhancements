@@ -16,6 +16,7 @@
     - [Ensuring Validation Equivalence With Testing](#ensuring-validation-equivalence-with-testing)
   - [Introduce Feature Gates: <code>DeclarativeValidation</code> &amp; <code>DeclarativeValidationTakeover</code>](#introduce-feature-gates-declarativevalidation--declarativevalidationtakeover)
     - [<code>DeclarativeValidation</code> &amp; <code>DeclarativeValidationTakeover</code> Will Target Beta From The Beginning](#declarativevalidation--declarativevalidationtakeover-will-target-beta-from-the-beginning)
+    - [<code>DeclarativeValidation</code> Beta to GA Graduation process](#declarativevalidation-beta-to-ga-graduation-process)
   - [Linter](#linter)
   - [Documentation Generation](#documentation-generation)
 - [DV-Only Graduation Plan](#dv-only-graduation-plan)
@@ -227,6 +228,8 @@ func Validate_ReplicationControllerSpec(opCtx operation.Context, obj, oldObj *co
 
 This generated code will then be used in the kube-apiserver to validate API requests.
 
+After three releases (v1.33-v1.35) of proven stability via mismatch metrics, the focus is transitioning to GA of the core machinery in v1.36.
+
 ## Motivation
 
 Kubernetes API validation rules are currently written by hand, which makes them difficult for users to access directly, review, maintain, and test.
@@ -343,7 +346,7 @@ Verifying that a field/type that is migrated is appropriately tested with proper
 Additionally, to aid in ensuring that the validation is identical across current hand-written validation and declarative validations, we will create a runtime check controlled by the `DeclarativeValidation` and `DeclarativeValidationTakeover` feature gates. When `DeclarativeValidation` is enabled, both hand-written and declarative validation will be run.  Any mismatches will be logged and a `declarative_validation_mismatch_total` metric will be incremented.  The `DeclarativeValidationTakeover` gate controls which result (imperative or declarative) is returned to the user.
 ### Introduce Feature Gates: `DeclarativeValidation` & `DeclarativeValidationTakeover`
 
-Two new feature gates will be introduced:
+Two feature gates were introduced in v1.33 to manage the rollout:
 
 *   **`DeclarativeValidation`**:  This gate controls whether declarative validation is *enabled* for a given resource or field.  When enabled, both imperative (hand-written) and declarative validation will run.  The results will be compared, and any mismatches will be logged and reported via metrics (see `DeclarativeValidationTakeover` below).  The imperative validation result will be returned to the user.  When disabled, only imperative validation runs.
 
@@ -354,6 +357,9 @@ Two new feature gates will be introduced:
 Declarative Validation will target the Beta stage from the beginning (vs Alpha).  Additionally, `DeclarativeValidation` is targeting Beta with `default:true`.  This is because Declarative Validation is not new functionality, but an alternative implementation of validation, and users should not be able to perceive any changes when swapping hand-written validation with identical declarative validation.  The feature gate, `DeclarativeValidation`, exists as a safety mechanism in case a mistake is made so that users can turn it off and get back to safety. There is prior art for this rationale where other feature gates did not target Alpha as they were not related to new functionality (changing underlying behavior, bugfix, etc.).  An example of this is the current feature gate `AllowParsingUserUIDFromCertAuth`, which was introduced in Beta as `default:true` as it is not a net new feature but fixes a current issue ([PR](https://github.com/kubernetes/kubernetes/pull/127897), [feature gate](https://github.com/kubernetes/kubernetes/blob/master/pkg/features/versioned_kube_features.go#L228-L230)). 
 
 `DeclarativeValidationTakeover` will default to `false` initially in Beta.  This way during the initial rollout we can "soak" and verify that the errors produced for a replaced validation rule (handwritten -> declarative) are identical.  Over time the goal is to flip `DeclarativeValidationTakeover` to be default `true` such that for fields where declarative validation rules exist, they are used as the authoritative validation rule.
+
+#### `DeclarativeValidation` Beta to GA Graduation process
+To graduate the `DeclarativeValidation` feature gate to from Beta to GA we need to show that the safety mechanisms we have for running declarative validation alongside hand-written code (in "shadow" mode as part of migrating) is stable.  These include DV's runtime mismatch checking logic, DV's metrics pipeline, and DV's panic recovery logic.  The plan is to consider the `DeclarativeValidation` (which only toggles running declarative validations in shadow mode, NOT making DV validations authoritative over hand-written code) GA after a period of three release cycles with no `declarative_validation_mismatch_total` or `declarative_validation_panic_total` failures in production (achieved v1.33-v1.35).
 
 ### Linter
 
@@ -1983,6 +1989,8 @@ If the API server is failing to meet SLOs (latency, validation error-rate, etc.)
 ## Implementation History
 
 v1.35: Dual implementation (DV + hand-written) requirement enforced, no DV-Only usage, tag/feature stability data collection and stability codified, validation library for dual implementation
+
+v1.36: Graduate the `DeclarativeValidation` feature gate to GA. The `DeclarativeValidationTakeover` feature gate remains off by default.
 
 ## Drawbacks
 

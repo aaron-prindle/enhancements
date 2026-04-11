@@ -245,11 +245,15 @@ The `DeclarativeValidationBeta` gate is a global "all-or-nothing" switch for rul
 
 ### Solution: Lifecycle Tags
 
-We adopt a standard Alpha/Beta/GA lifecycle for validation rules, controlled by tag prefixes:
+We adopt a standard Alpha/Beta/GA lifecycle for validation rules, controlled by prefix tags that wrap individual validator tags. Every rule lives in exactly one lifecycle state, and transitions between states are always explicit source-code edits (no runtime or binary-version-triggered auto-graduation — see "Non-goals" in the per-rule lifecycle process below).
 
-*   **+k8s:alpha**: Shadow mode (Metrics only).
-*   **+k8s:beta**: Enforced by default, but disable-able via the global `DeclarativeValidationBeta` gate.
-*   **no prefix tag**: Permanently enforced.
+*   **`+k8s:alpha(since: "1.N")=<validator>`**: Shadow mode (metrics only). Declarative validator runs, but handwritten validation is authoritative.
+*   **`+k8s:beta(since: "1.N")=<validator>`**: Enforced by default, but disable-able via the global `DeclarativeValidationBeta` gate.
+*   **`<validator>` (no prefix)**: Permanently enforced.
+
+The `since:` argument records the Kubernetes minor version at which the lifecycle state was entered. It is mandatory in `staging/src/k8s.io/api/**` (lint-enforced — see "Linter" below) and uses the format `"1.N"` as a string literal (quoted, no `v` prefix). This format intentionally differs from `+k8s:prerelease-lifecycle-gen:introduced=1.N` (unquoted) because the declarative validation tags use the `codetags` named-argument grammar; the difference is worth flagging in reviews.
+
+Ownership of lifecycle transitions is community-driven with linter-assisted nagging: the author of a rule is the default owner of its graduation PR, the linter surfaces overdue graduations as warnings and then errors, and any contributor may pick up an overdue rule. The Declarative Validation subproject leads are the escalation path. See the "Lifecycle: Promotion Process (Continuous)" section below for the full ownership model and graduation criteria.
 
 Declarative validation will benefit Kubernetes maintainers:
 
@@ -384,10 +388,17 @@ Execution and authority are determined by two feature gates (`DeclarativeValidat
 1.  **Execution (Is it running?)**:
     1.  DV runs if `DeclarativeValidation` is Enabled OR the resource uses `WithDeclarativeEnforcement()`.
     2.  Note: Using the strategy ensures New APIs run even if the main gate is disabled.
-2.  Enforcement:
-    1.  **Standard Tags:** Always Enforced (Bypasses Beta Gate).
-    2.  **Beta Tags:** Enforced if `DeclarativeValidationBeta` is Enabled. Otherwise Shadowed.
-    3.  **Alpha Tags:** Always Shadowed.
+2.  Enforcement (by the stability level stamped on each generated validator at code-generation time — see "Two stability axes" note below):
+    1.  **Unwrapped (`ValidationStabilityLevel` = stable):** Always Enforced. Bypasses the Beta gate.
+    2.  **Wrapped in `+k8s:beta(since: "1.N")` (`ValidationStabilityLevel` = Beta):** Enforced if `DeclarativeValidationBeta` is enabled. Otherwise Shadowed.
+    3.  **Wrapped in `+k8s:alpha(since: "1.N")` (`ValidationStabilityLevel` = Alpha):** Always Shadowed.
+
+**Two stability axes (important).** There are two independent "stability" properties to keep straight:
+
+*   **Tag stability (`TagStabilityLevel`)** — a property of a *validator tag definition*, set in Go source by the validator author (e.g., `+k8s:minimum` is a Beta tag; `+k8s:forbidden` is an Alpha tag). Governed by the "Graduation Criteria" section below (Complex Tags / Straightforward Tags).
+*   **Validation-instance stability (`ValidationStabilityLevel`)** — a property of a *specific application* of a tag on a field in `types.go`, set by wrapping in `+k8s:alpha(since: "1.N")` or `+k8s:beta(since: "1.N")`. Governed by the "Lifecycle: Promotion Process (Continuous)" section below.
+
+The enforcement table above reads the validation-instance axis. The per-package-path rules enforced by the linter's `validationStability()` check (see "Linter" below) read *both* axes: the tag-stability of the inner validator must be ≥ the context stability level of the containing package, with wrappers able to override the context.
 
 #### Feature Gate Graduation Criteria
 
@@ -410,6 +421,31 @@ We will integrate the linter functionality directly into `validation-gen` and co
 *   **Leveraging Existing Infrastructure:** The linter can leverage the existing code in `validation-gen` for parsing Go source files, extracting validation tags, and traversing the type tree.
 *   **Integration with Code Generation:** The linter can be integrated into the code generation workflow, ensuring that validation tags are checked before code is generated. For example, we could add a `--lint` flag.
 *   **CI Integration:** It's easy to integrate the linter into CI pipelines as part of the build and test process. We could run `validation-gen` with `--lint` flag and fail the build if any linting errors are found.
+
+#### Lifecycle Tag Lint Rules
+
+Lifecycle tag lint rules live primarily in `validation-gen`'s internal lint harness, co-located with the existing `alphaBetaPrefix`, `validationStability`, and `requiredAndOptional` rules. They share a `codetags` parser, a test harness, and the `hack/update-codegen.sh` / `hack/verify-codegen.sh` invocation path. Out-of-tree consumers of `validation-gen` (kube-aggregator, apiextensions-apiserver, custom controllers) get the lifecycle rules for free along with the existing rules.
+
+One rule (per-field alpha ⊥ beta consistency) lives in `kube-api-linter` because the existing `conflictingmarkers` linter already implemented mutual-exclusion over marker sets and enabling it cost 5 lines of YAML — rewriting it in `validation-gen` would have been more code for less coverage. This is a pragmatic exception, not a general direction.
+
+**Rules in `validation-gen`'s internal lint harness**
+(`staging/src/k8s.io/code-generator/cmd/validation-gen/lint_rules.go`):
+
+*   **Root-only placement (`alphaBetaPrefix`)**: `+k8s:alpha` and `+k8s:beta` may only appear as the outermost wrapper of a validator comment line. They cannot be nested inside another validator (e.g. `+k8s:eachVal=+k8s:alpha(...)=...` is rejected). The payload is also required to be a validator tag.
+*   **Package-path stability (`validationStability`)**: The tag-stability of the inner validator must be ≥ the context stability level inferred from the containing package path (`*/v1alphaN` → Alpha context; `*/v1betaN` → Beta context; otherwise Stable context). Non-stable tags in stable packages must be wrapped to raise the context.
+*   **Mandatory `since:` argument (`lifecycleSinceRequired`, new in v1.37)**: In files under `staging/src/k8s.io/api/**`, `+k8s:alpha` and `+k8s:beta` without a `since:` argument are rejected. The bare form is still accepted in `code-generator/.../output_tests/**` where the lint is not applied.
+*   **Stale `since:` graduation reminders (`lifecycleStaleSince`, new in v1.37)**: A parallel warning pipeline is added to `validation-gen`'s lint harness (warnings print but do not fail generation). The linter reads the current Kubernetes minor version (from `--current-release=1.N` on the `validation-gen` CLI, or by text-reading `DefaultKubeBinaryVersion` from `staging/src/k8s.io/component-base/version/base.go` when running in-tree) and classifies each lifecycle wrapper by how many releases overdue it is:
+    *   `+k8s:alpha(since: "1.N")`: silent at N, warning at N+1 (eligible to graduate), error at N+2 or later (overdue).
+    *   `+k8s:beta(since: "1.N")`: silent at N and N+1, warning at N+2 (eligible to remove wrapper), error at N+3 or later.
+    *   Exemptions can be declared per-field via `// +k8s:validation-lifecycle-exempt=<reason>` with a tracking issue in `<reason>`. Exemptions are reviewed by the Declarative Validation subproject leads at the end of each release.
+    *   If neither `--current-release` nor the in-tree `base.go` can be found, the rule is silently skipped (never fires). This keeps `validation-gen` usable by out-of-tree consumers that don't know about `DefaultKubeBinaryVersion`.
+
+**Rule in `kube-api-linter`**
+(configured via `hack/kube-api-linter/kube-api-linter.yaml`):
+
+*   **Per-field lifecycle consistency** (`conflictingmarkers`, conflict set `declarative_validation_lifecycle_alpha_vs_beta`, **landed in v1.36**): A single struct field may not carry both `+k8s:alpha(...)` and `+k8s:beta(...)` wrappers across its validations. Mixing signals a half-finished migration. This rule reuses the existing `conflictingmarkers` linter that already enforces other mutual-exclusion rules (`optional_vs_required`, `required_vs_default`) — no new linter code was required, only a config entry.
+
+All enforcement is at generation/lint time. The runtime does not read `since:` values and a rule never changes state on binary-version bump — this is a deliberate divergence from `APILifecycleRemoved`, whose auto-derivation behavior caused issue [#127249](https://github.com/kubernetes/kubernetes/issues/127249).
 
 ### Documentation Generation
 
@@ -464,12 +500,14 @@ Our goal is to standardize on the Explicit Strategy and Lifecycle mechanism. The
 
   - **Action:** Legacy APIs adopt `WithDeclarativeEnforcement()`.
   - **Tag Updates:**
-      - **Verified fields (Legacy):** Convert standard tags to `+k8s:beta`.
+      - **Verified fields (Legacy):** Convert standard tags to `+k8s:beta(since: "1.37")` (see "Legacy fast-path" under "Lifecycle: Promotion Process" below).
           - **Reasoning:** These fields have soaked. We are ready to enforce, but want the safety switch.
-      - **New Rules:** Use `+k8s:alpha`.
+      - **New Rules:** Use `+k8s:alpha(since: "1.37")`.
   - **Runtime Effect:**
       - `DeclarativeValidationBeta` ON: Beta tags are Enforced.
       - `DeclarativeValidationBeta` OFF: Beta tags are Shadowed.
+  - **Tooling:**
+      - **Lifecycle lint rules (see "Lifecycle Tag Lint Rules" under "Linter" above) roll out across v1.36 and v1.37.** Per-field lifecycle consistency (alpha ⊥ beta) lands in **v1.36** via a config-only entry in kube-api-linter's existing `conflictingmarkers` rule. Mandatory `since:` (`lifecycleSinceRequired`) and stale-`since:` graduation reminders (`lifecycleStaleSince`) land in **v1.37** inside `validation-gen`'s internal lint harness. The latter also introduces a warning pipeline in the harness — warnings print but do not fail generation — allowing graduation reminders to surface without blocking unrelated PRs until the field is truly overdue.
 
 ### Phase 3: v1.39+ (Gate Removal & GA)
 
@@ -480,24 +518,62 @@ Our goal is to standardize on the Explicit Strategy and Lifecycle mechanism. The
 
 ## Lifecycle: Promotion Process (Continuous)
 
-This process applies to any individual validation rule.
+This process applies to any individual validation rule (a specific application of a validator tag on a specific field), and is distinct from the "Graduation Criteria" section below which governs tag *definitions*. See the "Two stability axes" note under "Execution & Authority Logic" for the distinction.
 
-**Step 1: Alpha (Shadow)**
+### State machine
 
-  - **Action:** Add rule with `+k8s:alpha(since:v1.N)=....`
-  - **Status:** Shadowed. Gather metrics.
+```
+            (graduate)                  (graduate)
+  Alpha  ─────────────▶   Beta   ─────────────▶   Unwrapped / Stable
+```
 
-**Step 2: Beta (Gated)**
+Transitions are always explicit source-code edits. Nothing graduates on binary-version bump. This is deliberately different from `APILifecycleRemoved`, whose auto-derivation behavior caused issue [#127249](https://github.com/kubernetes/kubernetes/issues/127249) — we are not repeating that mistake.
 
-  - **Prerequisite:** 1 Release of clean metrics.
-  - **Action:** Change prefix to `+k8s:beta(since:v1.N+1)=....`
-  - **Status:** Enforced (Safety Switch active).
+### Entry rules: Alpha vs Beta vs Unwrapped
 
-**Step 3: GA (Permanent)**
+The starting state depends on the rule's history:
 
-  - **Prerequisite:** Confidence in Beta stability.
-  - **Action:** Remove prefix. Delete handwritten code.
-  - **Status:** Enforced.
+| Situation | Start at |
+|---|---|
+| New validation rule on an existing field | **Alpha** |
+| New field in an existing API kind (validation on that field) | **Alpha** |
+| Legacy validation migrated from handwritten code, where the field predates v1.36 | **Beta** (legacy fast-path — see below) |
+| New API kind using `WithDeclarativeEnforcement()` from day 1 | **Unwrapped** (authoritative) |
+| Rule on a field in an alpha API package (`*/v1alphaN`) | **Unwrapped** — the entire API version is already non-authoritative |
+| Rule on a field in a beta API package (`*/v1betaN`) | **Unwrapped** or **Alpha** (Alpha only for net-new rules) |
+
+**Legacy fast-path.** Fields that existed with handwritten validation on or before v1.35 may skip Alpha and be migrated directly to Beta. Rationale: the rule has already soaked in implicit shadow mode (see "The Implicit Shadow Reality" above). The fast-path is scoped to *migration* only — a brand-new rule added in v1.36 or later on a legacy field is a new rule and must start at Alpha.
+
+### Step 1: Alpha (Shadow)
+
+  - **Action:** Add rule with `+k8s:alpha(since: "1.N")=<validator>` where `N` is the current Kubernetes minor version.
+  - **Status:** Shadowed regardless of feature gate state. Handwritten validation is authoritative. Gather metrics via `declarative_validation_mismatch_total`.
+  - **Owner:** The PR author. They are the default owner of the graduation PR one release later.
+
+### Step 2: Beta (Gated)
+
+  - **Prerequisite — time:** the rule's `since:` version has shipped in a released kube minor for at least one full release cycle. In practice: a rule added in 1.N can graduate to Beta no earlier than 1.N+1.
+  - **Prerequisite — metrics:** no `declarative_validation_mismatch_total` increments attributable to the containing resource during the soak window, based on production-scale signal collected by the Declarative Validation subproject.
+    - *Attribution note:* the current mismatch metric labels by resource, not by individual rule site. We accept resource-level attribution: if the resource saw no mismatches during the soak, all Alpha rules on that resource are eligible. Per-rule labeling is tracked as a follow-up and is not a blocker.
+  - **Prerequisite — tests:** equivalence tests exist and pass for the rule (per "Ensuring Validation Equivalence With Testing" above).
+  - **Action:** Change prefix to `+k8s:beta(since: "1.N+1")=<validator>`.
+  - **Status:** Enforced when `DeclarativeValidationBeta` is enabled (default true in 1.36). Shadowed when the gate is disabled, so the safety switch remains available.
+  - **Owner:** Default is the original author of the Alpha rule. The linter surfaces overdue graduations as warnings and then errors, and any contributor may pick up an overdue rule. The Declarative Validation subproject leads are the escalation path.
+
+### Step 3: GA (Permanent)
+
+  - **Prerequisite — time:** the rule has shipped at Beta for at least one full release cycle with `DeclarativeValidationBeta` enabled by default.
+  - **Prerequisite — metrics:** no `declarative_validation_mismatch_total` increments on the containing resource during that window.
+  - **Prerequisite — handwritten cleanup:** if this rule is a migration from handwritten validation, the graduation PR must delete the handwritten equivalent in the same change. Otherwise both run.
+  - **Action:** Remove the wrapper; the validator stands alone as `<validator>`.
+  - **Status:** Permanently enforced.
+  - **Owner:** Same ownership model as Beta graduation.
+
+### Non-goals
+
+*   **No runtime enforcement of `since:`.** The kube-apiserver does not read `since:` values. It only reads the stability level stamped into the generated validator at code-generation time.
+*   **No auto-graduation.** A rule never changes state without a source-code edit.
+*   **No metric-driven enforcement in-lint.** The linter does not read the mismatch metric to decide graduation eligibility. That judgment is made by the reviewer of the graduation PR and recorded in the PR description.
 
 ### Example Walkthrough: Two-Field Migration
 
@@ -542,10 +618,10 @@ func (s *Strategy) Validate(ctx, obj) {
   - **types.go:**
 
 ```go
-// +k8s:beta(since:v1.39)=+k8s:minimum=1 <--- DIRECTLY TO BETA
+// +k8s:beta(since: "1.39")=+k8s:minimum=1 <--- DIRECTLY TO BETA
 FieldA int `json:"fieldA"` // <-- Disable-able enforcement
 
-// +k8s:alpha(since:1.39)=+k8s:maximum=10 <-- NEWLY MIGRATED START FROM ALPHA
+// +k8s:alpha(since: "1.39")=+k8s:maximum=10 <-- NEWLY MIGRATED START FROM ALPHA
 FieldB int `json:"fieldB"`
 ```
 
@@ -563,7 +639,7 @@ rest.WithDeclarativeEnforcement()
 // +k8s:minimum=1 // <--- PREFIX REMOVED (CANNOT DISABLE)
 FieldA int `json:"fieldA"`
 
-// +k8s:beta(since:1.40)=+k8s:maximum=10 // <--- Disable-able enforcement
+// +k8s:beta(since: "1.40")=+k8s:maximum=10 // <--- Disable-able enforcement
 FieldB int `json:"fieldB"`
 ```
 
@@ -1855,6 +1931,8 @@ We will instrument as many e2e tests as necessary  comparing enablement/disablem
 To ensure that Declarative Validation and some of the identified potential performance differences (eg: additional conversion for validation) do not meaningfully impact performance, an E2E benchmark test will be created to evaluate the performance of declarative validation.  This way we will be able to ensure that declarative validation meets the performance criteria necessary for GA.
 
 ### Graduation Criteria
+
+This section governs the promotion of a **validator tag definition** from one stability level to the next (the `TagStabilityLevel` axis — e.g. "is `+k8s:minimum` a Beta tag or a Stable tag?"). It is distinct from the promotion of an individual **validation rule** on a specific field (the `ValidationStabilityLevel` axis), which is covered by the "Lifecycle: Promotion Process (Continuous)" section above. The two axes are independent: a Stable tag can be used in an Alpha rule (by wrapping it), and a rule on an Alpha tag must always be wrapped until the tag itself graduates.
 
 The promotion of a tag from one stability level to the next follows a defined set of criteria to ensure quality and reliability.
 
